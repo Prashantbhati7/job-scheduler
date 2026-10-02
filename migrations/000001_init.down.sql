@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS run_logs;
+DROP TABLE IF EXISTS job_runs;
+DROP TABLE IF EXISTS workers;
+DROP TABLE IF EXISTS jobs;
+
+DROP TYPE IF EXISTS worker_status;
+DROP TYPE IF EXISTS job_run_status;
