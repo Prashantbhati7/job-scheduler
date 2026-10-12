@@ -1,10 +1,17 @@
 include .env
 export
 
-.PHONY: up down reset logs migrate-up migrate-down psql topics scheduler-test worker-test test
+.PHONY: up down reset logs migrate-up migrate-down psql topics scheduler-test worker-test test api-dev api-test
 
 test:
 	cd go-scheduler && go test -v ./...
+	cd api && npm test
+
+api-dev:
+	cd api && npm run dev
+
+api-test:
+	cd api && npm test
 
 up:
 	docker compose up -d
