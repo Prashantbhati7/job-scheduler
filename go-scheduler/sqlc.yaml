@@ -1,0 +1,27 @@
+version: "2"
+sql:
+  - engine: "postgresql"
+    queries: "db/query"
+    schema: "../migrations"
+    gen:
+      go:
+        package: "db"
+        out: "db"
+        sql_package: "pgx/v5"
+        emit_json_tags: true
+        emit_db_tags: true
+        emit_interface: true          # generates a Querier interface — used by tests/mocks
+        emit_empty_slices: true       # FetchDueJobs returns [] not nil when empty
+        emit_pointers_for_null_types: true
+        overrides:
+          # Map Postgres UUIDs to [16]byte (pgx native) for zero-alloc ID handling
+          - db_type: "uuid"
+            go_type: "github.com/jackc/pgx/v5/pgtype.UUID"
+          # Map timestamptz to pgtype.Timestamptz for nullable-safe handling
+          - db_type: "pg_catalog.timestamptz"
+            go_type: "github.com/jackc/pgx/v5/pgtype.Timestamptz"
+          # Map jsonb to json.RawMessage — callers can json.Unmarshal as needed
+          - db_type: "pg_catalog.jsonb"
+            go_type:
+              import: "encoding/json"
+              type: "RawMessage"

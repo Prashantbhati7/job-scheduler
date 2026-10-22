@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/config"
@@ -11,6 +13,7 @@ import (
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/election"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/kafka"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/redis"
+	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/scheduler"
 )
 
 func main() {
@@ -71,9 +74,23 @@ func main() {
 		os.Exit(1)
 	}
 	defer etcdClient.Close()
-	slog.Info("etcd connection established and verified",
-		"endpoints", cfg.Etcd.Endpoints,
-	)
+	slog.Info("All scheduler dependencies connected successfully.")
 
-	slog.Info("All scheduler dependencies connected successfully. Exiting cleanly.")
+	if os.Getenv("CHECK_DEPS_ONLY") == "true" {
+		slog.Info("CHECK_DEPS_ONLY is set. Exiting cleanly.")
+		return
+	}
+
+	sched := scheduler.New(pgPool, 1*time.Second)
+
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	slog.Info("Scheduler starting polling loop. Press Ctrl+C / SIGTERM to stop.")
+	if err := sched.Run(runCtx); err != nil {
+		slog.Error("Scheduler loop stopped with error", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Scheduler service exited cleanly.")
 }
