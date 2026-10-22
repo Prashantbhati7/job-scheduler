@@ -8,12 +8,8 @@ import (
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/db"
 )
 
-// Handler represents the execution logic for a scheduled job.
 type Handler func(ctx context.Context, job db.Job) error
 
-// DummyHandler is a placeholder executor for Step 1.
-// In later milestones, jobs will be published to Kafka and consumed by workers.
-// In Step 1, it logs the job execution, simulates work, and completes successfully.
 func DummyHandler(ctx context.Context, job db.Job) error {
 	slog.Info("DummyHandler executing job",
 		"job_id", pgUUIDStr(job.ID),
