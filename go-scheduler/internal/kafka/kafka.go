@@ -11,13 +11,10 @@ import (
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/config"
 )
 
-// Client encapsulates Kafka connections and configuration.
 type Client struct {
 	cfg  config.KafkaConfig
 	conn *kafka.Conn
 }
-
-// Connect establishes a connection to the Kafka cluster and verifies broker accessibility.
 func Connect(ctx context.Context, cfg config.KafkaConfig) (*Client, error) {
 	if len(cfg.Brokers) == 0 {
 		return nil, fmt.Errorf("no kafka brokers configured")
@@ -52,7 +49,7 @@ func Connect(ctx context.Context, cfg config.KafkaConfig) (*Client, error) {
 	}, nil
 }
 
-// Close closes the underlying Kafka connection.
+
 func (c *Client) Close() error {
 	if c.conn != nil {
 		return c.conn.Close()
@@ -60,12 +57,10 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// Brokers returns the list of brokers configured.
 func (c *Client) Brokers() []string {
 	return c.cfg.Brokers
 }
 
-// NewWriter returns a standard Kafka writer for a given topic.
 func (c *Client) NewWriter(topic string) *kafka.Writer {
 	return &kafka.Writer{
 		Addr:         kafka.TCP(c.cfg.Brokers...),
@@ -76,7 +71,6 @@ func (c *Client) NewWriter(topic string) *kafka.Writer {
 	}
 }
 
-// NewReader returns a standard Kafka reader for a given topic and consumer group.
 func (c *Client) NewReader(topic, groupID string) *kafka.Reader {
 	return kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        c.cfg.Brokers,
@@ -91,7 +85,6 @@ func (c *Client) NewReader(topic, groupID string) *kafka.Reader {
 	})
 }
 
-// CheckBrokerAddress helper to validate host/port format.
 func CheckBrokerAddress(addr string) error {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {

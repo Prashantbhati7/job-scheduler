@@ -10,9 +10,11 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	kafkago "github.com/segmentio/kafka-go"
 
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/db"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/cronutil"
+	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/kafka"
 )
 
 
@@ -20,31 +22,27 @@ type Scheduler struct {
 	pool         *pgxpool.Pool
 	queries      db.Querier
 	pollInterval time.Duration
-	handler      Handler
+	writer       *kafkago.Writer
 }
 
-// New creates a Scheduler backed by the given pool with default DummyHandler.
-func New(pool *pgxpool.Pool, pollInterval time.Duration) *Scheduler {
-	return NewWithQuerier(db.New(pool), pool, pollInterval, DummyHandler)
+
+func New(pool *pgxpool.Pool, pollInterval time.Duration, writer *kafkago.Writer) *Scheduler {
+	return NewWithQuerier(db.New(pool), pool, pollInterval, writer)
 }
 
-func NewWithQuerier(queries db.Querier, pool *pgxpool.Pool, pollInterval time.Duration, handler Handler) *Scheduler {
-	if handler == nil {
-		handler = DummyHandler
-	}
+// injecting a mock Querier for unit tests.
+func NewWithQuerier(queries db.Querier, pool *pgxpool.Pool, pollInterval time.Duration, writer *kafkago.Writer) *Scheduler {
 	return &Scheduler{
 		pool:         pool,
 		queries:      queries,
 		pollInterval: pollInterval,
-		handler:      handler,
+		writer:       writer,
 	}
 }
 
 func (s *Scheduler) Run(ctx context.Context) error {
-	slog.Info("Scheduler loop starting",
-		"poll_interval", s.pollInterval.String(),
-	)
-	// On startup, ensure every enabled job has next_run_at set.
+	slog.Info("Scheduler loop starting", "poll_interval", s.pollInterval.String())
+	
 	if err := s.bootstrapNextRuns(ctx); err != nil {
 		slog.Warn("Bootstrap of next_run_at encountered errors", "error", err)
 	}
@@ -63,9 +61,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// tick performs one poll cycle: fetch due jobs and process each one.
 func (s *Scheduler) tick(ctx context.Context) {
-	// Limit each tick to 100 jobs; on large backlogs we don't want one tick to hold locks for too long.
 	const batchSize = 100
 
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -78,13 +74,12 @@ func (s *Scheduler) tick(ctx context.Context) {
 	}
 
 	if len(jobs) == 0 {
-		return // nothing due
+		return
 	}
 
 	slog.Info("Tick: due jobs found", "count", len(jobs))
 
 	for _, job := range jobs {
-		// Each job processed in its own goroutine so one slow job doesn't stall others. Step 3 will add proper worker-pool concurrency.
 		go func(j db.Job) {
 			if err := s.processJob(ctx, j); err != nil {
 				slog.Error("Failed to process job",
@@ -100,8 +95,6 @@ func (s *Scheduler) tick(ctx context.Context) {
 
 func (s *Scheduler) processJob(ctx context.Context, job db.Job) error {
 	jobIDStr := pgUUIDStr(job.ID)
-
-	//Advance next_run_at
 	scheduledFor := job.NextRunAt.Time
 
 	nextRun, err := cronutil.NextRun(job.CronExpr, job.Timezone, scheduledFor)
@@ -109,10 +102,10 @@ func (s *Scheduler) processJob(ctx context.Context, job db.Job) error {
 		return fmt.Errorf("cron parse error for job %s (%s): %w", jobIDStr, job.CronExpr, err)
 	}
 
-	advanceCtx, advCancel := context.WithTimeout(ctx, 5*time.Second)
+	advCtx, advCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer advCancel()
 
-	if err := s.queries.AdvanceNextRun(advanceCtx, db.AdvanceNextRunParams{
+	if err := s.queries.AdvanceNextRun(advCtx, db.AdvanceNextRunParams{
 		ID:        job.ID,
 		NextRunAt: pgtype.Timestamptz{Time: nextRun, Valid: true},
 	}); err != nil {
@@ -125,7 +118,6 @@ func (s *Scheduler) processJob(ctx context.Context, job db.Job) error {
 		"next_run_at", nextRun.Format(time.RFC3339),
 	)
 
-	// Create run (idempotent)
 	createCtx, createCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer createCancel()
 
@@ -137,7 +129,6 @@ func (s *Scheduler) processJob(ctx context.Context, job db.Job) error {
 		return fmt.Errorf("create run for job %s: %w", jobIDStr, err)
 	}
 
-	// ON CONFLICT DO NOTHING returns an empty UUID , Skip handler execution — idempotency preserved.
 	if !runID.Valid {
 		slog.Info("Run already exists for this tick — skipping (idempotent)",
 			"job_id", jobIDStr,
@@ -147,60 +138,53 @@ func (s *Scheduler) processJob(ctx context.Context, job db.Job) error {
 	}
 
 	runIDStr := pgUUIDStr(runID)
-	slog.Info("Run created",
+	slog.Info("Run row created — publishing to Kafka",
 		"run_id", runIDStr,
 		"job_id", jobIDStr,
 		"job_name", job.Name,
 		"scheduled_for", scheduledFor.Format(time.RFC3339),
 	)
 
-	//  Execute handler
-	handler := s.handler
-	if handler == nil {
-		handler = DummyHandler
-	}
-	handlerErr := runWithRecover(ctx, job, handler)
-
-	// Finish run 
-	finishCtx, finishCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer finishCancel()
-
-	status := db.JobRunStatusSUCCEEDED
-	var errMsg *string
-
-	if handlerErr != nil {
-		status = db.JobRunStatusFAILED
-		msg := handlerErr.Error()
-		errMsg = &msg
+	// 3. Publish to Kafka. Workers consume and execute.
+	msg := &kafka.JobMessage{
+		Version:        kafka.CurrentVersion,
+		RunID:          runIDStr,
+		JobID:          jobIDStr,
+		JobName:        job.Name,
+		CronExpr:       job.CronExpr,
+		Timezone:       job.Timezone,
+		Payload:        json.RawMessage(job.Payload),
+		MaxRetries:     job.MaxRetries,
+		TimeoutSeconds: job.TimeoutSeconds,
+		ScheduledFor:   scheduledFor,
+		EnqueuedAt:     time.Now().UTC(),
 	}
 
-	if err := s.queries.FinishRun(finishCtx, db.FinishRunParams{
-		ID:     runID,
-		Status: status,
-		Error:  errMsg,
+	value, err := msg.Encode()
+	if err != nil {
+		return fmt.Errorf("encode kafka message for run %s: %w", runIDStr, err)
+	}
+
+	// Key by job_id so all runs for a given job always land on the same partition, preserving ordering within a single job.
+	publishCtx, publishCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer publishCancel()
+
+	if err := s.writer.WriteMessages(publishCtx, kafkago.Message{
+		Key:   []byte(jobIDStr),
+		Value: value,
 	}); err != nil {
-		return fmt.Errorf("finish run %s: %w", runIDStr, err)
+		return fmt.Errorf("publish to kafka for run %s: %w", runIDStr, err)
 	}
 
-	if handlerErr != nil {
-		slog.Error("Run finished with error",
-			"run_id", runIDStr,
-			"job_name", job.Name,
-			"status", status,
-			"error", handlerErr,
-		)
-	} else {
-		slog.Info("Run finished successfully",
-			"run_id", runIDStr,
-			"job_name", job.Name,
-			"status", status,
-		)
-	}
+	slog.Info("JobMessage published to Kafka",
+		"run_id", runIDStr,
+		"job_id", jobIDStr,
+		"topic", s.writer.Topic,
+	)
 
 	return nil
 }
 
-// This handles jobs inserted via psql/seed before the API is built.
 func (s *Scheduler) bootstrapNextRuns(ctx context.Context) error {
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -245,7 +229,6 @@ func (s *Scheduler) bootstrapNextRuns(ctx context.Context) error {
 	return nil
 }
 
-// runWithRecover executes the handler and catches panics, converting them to errors.
 func runWithRecover(ctx context.Context, job db.Job, fn func(context.Context, db.Job) error) (retErr error) {
 	defer func() {
 		if r := recover(); r != nil {

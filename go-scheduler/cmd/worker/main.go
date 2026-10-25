@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/config"
@@ -11,6 +13,7 @@ import (
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/election"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/kafka"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/redis"
+	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/worker"
 )
 
 func main() {
@@ -28,52 +31,68 @@ func main() {
 	}
 	slog.Info("Configuration loaded successfully")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer initCancel()
 
-	pgPool, err := db.Connect(ctx, cfg.Postgres)
+	pgPool, err := db.Connect(initCtx, cfg.Postgres)
 	if err != nil {
 		slog.Error("Postgres connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer pgPool.Close()
-	slog.Info("Postgres connection established and verified",
+	slog.Info("Postgres connected",
 		"host", cfg.Postgres.Host,
 		"port", cfg.Postgres.Port,
 		"database", cfg.Postgres.DB,
 	)
 
-	rdb, err := redis.Connect(ctx, cfg.Redis)
+	rdb, err := redis.Connect(initCtx, cfg.Redis)
 	if err != nil {
 		slog.Error("Redis connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
-	slog.Info("Redis connection established and verified",
-		"addr", cfg.Redis.Addr,
-		"db", cfg.Redis.DB,
-	)
+	slog.Info("Redis connected", "addr", cfg.Redis.Addr)
 
-
-	kafkaClient, err := kafka.Connect(ctx, cfg.Kafka)
+	kafkaClient, err := kafka.Connect(initCtx, cfg.Kafka)
 	if err != nil {
 		slog.Error("Kafka connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer kafkaClient.Close()
-	slog.Info("Kafka connection established and verified",
+	slog.Info("Kafka connected",
 		"brokers", cfg.Kafka.Brokers,
-		"topic_runs", cfg.Kafka.TopicRuns,
+		"topic", cfg.Kafka.TopicRuns,
 	)
-	etcdClient, err := election.Connect(ctx, cfg.Etcd)
+
+	etcdClient, err := election.Connect(initCtx, cfg.Etcd)
 	if err != nil {
 		slog.Error("etcd connection failed", "error", err)
 		os.Exit(1)
 	}
 	defer etcdClient.Close()
-	slog.Info("etcd connection established and verified",
-		"endpoints", cfg.Etcd.Endpoints,
-	)
+	slog.Info("All dependencies connected.")
 
-	slog.Info("All worker dependencies connected successfully. Exiting cleanly.")
+	if os.Getenv("CHECK_DEPS_ONLY") == "true" {
+		slog.Info("CHECK_DEPS_ONLY is set. Exiting cleanly.")
+		return
+	}
+
+	// Each worker process joins the "workers" consumer group so Kafka
+	// distributes partitions automatically across running worker instances.
+	reader := kafkaClient.NewReader(cfg.Kafka.TopicRuns, "workers")
+	defer reader.Close()
+
+	consumer := worker.New(reader, pgPool, worker.DefaultHandler)
+
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	slog.Info("Worker consumer loop started. Press Ctrl+C / SIGTERM to stop.")
+	if err := consumer.Run(runCtx); err != nil {
+		slog.Error("Worker consumer stopped with error", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Worker service exited cleanly.")
 }
