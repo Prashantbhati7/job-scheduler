@@ -1,6 +1,6 @@
 import { app } from './app';
 import { config } from './config';
-import { closeDb,checkDbHealth} from './db';
+import { closeDb } from './db';
 
 const server = app.listen(config.api.port, () => {
   console.log(

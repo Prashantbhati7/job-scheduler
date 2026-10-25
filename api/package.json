@@ -10,6 +10,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "cron-parser": "^5.10.2",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "pg": "^8.13.3"
