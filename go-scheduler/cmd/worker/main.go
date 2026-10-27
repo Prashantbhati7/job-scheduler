@@ -40,11 +40,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer pgPool.Close()
-	slog.Info("Postgres connected",
-		"host", cfg.Postgres.Host,
-		"port", cfg.Postgres.Port,
-		"database", cfg.Postgres.DB,
-	)
+	slog.Info("Postgres connected", "host", cfg.Postgres.Host, "port", cfg.Postgres.Port)
 
 	rdb, err := redis.Connect(initCtx, cfg.Redis)
 	if err != nil {
@@ -60,10 +56,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer kafkaClient.Close()
-	slog.Info("Kafka connected",
-		"brokers", cfg.Kafka.Brokers,
-		"topic", cfg.Kafka.TopicRuns,
-	)
+	slog.Info("Kafka connected", "brokers", cfg.Kafka.Brokers)
 
 	etcdClient, err := election.Connect(initCtx, cfg.Etcd)
 	if err != nil {
@@ -78,12 +71,15 @@ func main() {
 		return
 	}
 
-	// Each worker process joins the "workers" consumer group so Kafka
-	// distributes partitions automatically across running worker instances.
+	// Consumer group "workers" — Kafka auto-distributes partitions across instances.
 	reader := kafkaClient.NewReader(cfg.Kafka.TopicRuns, "workers")
 	defer reader.Close()
 
-	consumer := worker.New(reader, pgPool, worker.DefaultHandler)
+	// DLQ writer — publishes exhausted runs for operator inspection/replay.
+	dlqWriter := kafkaClient.NewWriter(cfg.Kafka.TopicDLQ)
+	defer dlqWriter.Close()
+
+	consumer := worker.New(reader, dlqWriter, pgPool, worker.DefaultHandler)
 
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

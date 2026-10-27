@@ -33,6 +33,110 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (pgtype.UU
 	return id, err
 }
 
+const failRunForRetry = `-- name: FailRunForRetry :exec
+UPDATE job_runs
+SET
+    status       = 'RETRYING',
+    attempt      = $2,
+    next_retry_at = $3,
+    error        = $4,
+    finished_at  = NULL
+WHERE id = $1
+`
+
+type FailRunForRetryParams struct {
+	ID          pgtype.UUID        `db:"id" json:"id"`
+	Attempt     int32              `db:"attempt" json:"attempt"`
+	NextRetryAt pgtype.Timestamptz `db:"next_retry_at" json:"next_retry_at"`
+	Error       *string            `db:"error" json:"error"`
+}
+
+// Transition a RUNNING run to RETRYING state after a failure.
+// attempt is incremented by the caller before passing to avoid a round-trip.
+func (q *Queries) FailRunForRetry(ctx context.Context, arg FailRunForRetryParams) error {
+	_, err := q.db.Exec(ctx, failRunForRetry,
+		arg.ID,
+		arg.Attempt,
+		arg.NextRetryAt,
+		arg.Error,
+	)
+	return err
+}
+
+const fetchDueRetries = `-- name: FetchDueRetries :many
+SELECT
+    r.id,
+    r.job_id,
+    r.scheduled_for,
+    r.status,
+    r.attempt,
+    r.error,
+    j.name        AS job_name,
+    j.cron_expr   AS cron_expr,
+    j.timezone    AS timezone,
+    j.payload     AS payload,
+    j.max_retries AS max_retries,
+    j.timeout_seconds AS timeout_seconds
+FROM job_runs r
+JOIN jobs j ON r.job_id = j.id
+WHERE r.status = 'RETRYING'
+  AND r.next_retry_at <= now()
+  AND j.deleted_at IS NULL
+ORDER BY r.next_retry_at ASC
+LIMIT $1
+FOR UPDATE OF r SKIP LOCKED
+`
+
+type FetchDueRetriesRow struct {
+	ID             pgtype.UUID        `db:"id" json:"id"`
+	JobID          pgtype.UUID        `db:"job_id" json:"job_id"`
+	ScheduledFor   pgtype.Timestamptz `db:"scheduled_for" json:"scheduled_for"`
+	Status         JobRunStatus       `db:"status" json:"status"`
+	Attempt        int32              `db:"attempt" json:"attempt"`
+	Error          *string            `db:"error" json:"error"`
+	JobName        string             `db:"job_name" json:"job_name"`
+	CronExpr       string             `db:"cron_expr" json:"cron_expr"`
+	Timezone       string             `db:"timezone" json:"timezone"`
+	Payload        []byte             `db:"payload" json:"payload"`
+	MaxRetries     int32              `db:"max_retries" json:"max_retries"`
+	TimeoutSeconds int32              `db:"timeout_seconds" json:"timeout_seconds"`
+}
+
+// Fetch runs in RETRYING state whose next_retry_at has passed.
+// FOR UPDATE SKIP LOCKED means concurrent sweeper instances each grab a disjoint subset.
+func (q *Queries) FetchDueRetries(ctx context.Context, limit int32) ([]FetchDueRetriesRow, error) {
+	rows, err := q.db.Query(ctx, fetchDueRetries, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []FetchDueRetriesRow{}
+	for rows.Next() {
+		var i FetchDueRetriesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.JobID,
+			&i.ScheduledFor,
+			&i.Status,
+			&i.Attempt,
+			&i.Error,
+			&i.JobName,
+			&i.CronExpr,
+			&i.Timezone,
+			&i.Payload,
+			&i.MaxRetries,
+			&i.TimeoutSeconds,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const finishRun = `-- name: FinishRun :exec
 UPDATE job_runs
 SET
@@ -48,7 +152,7 @@ type FinishRunParams struct {
 	Error  *string      `db:"error" json:"error"`
 }
 
-// Mark run as SUCCEEDED or FAILED with the final error message.
+// Mark run as SUCCEEDED with the final status.
 func (q *Queries) FinishRun(ctx context.Context, arg FinishRunParams) error {
 	_, err := q.db.Exec(ctx, finishRun, arg.ID, arg.Status, arg.Error)
 	return err
@@ -124,4 +228,39 @@ func (q *Queries) ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) 
 		return nil, err
 	}
 	return items, nil
+}
+
+const markRunDead = `-- name: MarkRunDead :exec
+UPDATE job_runs
+SET
+    status      = 'DEAD',
+    finished_at = now(),
+    error       = $2
+WHERE id = $1
+`
+
+type MarkRunDeadParams struct {
+	ID    pgtype.UUID `db:"id" json:"id"`
+	Error *string     `db:"error" json:"error"`
+}
+
+// Transition a RUNNING run to DEAD (all retries exhausted).
+func (q *Queries) MarkRunDead(ctx context.Context, arg MarkRunDeadParams) error {
+	_, err := q.db.Exec(ctx, markRunDead, arg.ID, arg.Error)
+	return err
+}
+
+const markRunQueued = `-- name: MarkRunQueued :exec
+UPDATE job_runs
+SET
+    status        = 'RUNNING',
+    next_retry_at = NULL,
+    started_at    = now()
+WHERE id = $1
+`
+
+// Transition a RETRYING run back to QUEUED after the sweeper re-enqueues it.
+func (q *Queries) MarkRunQueued(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, markRunQueued, id)
+	return err
 }

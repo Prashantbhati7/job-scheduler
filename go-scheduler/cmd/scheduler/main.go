@@ -40,11 +40,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer pgPool.Close()
-	slog.Info("Postgres connected",
-		"host", cfg.Postgres.Host,
-		"port", cfg.Postgres.Port,
-		"database", cfg.Postgres.DB,
-	)
+	slog.Info("Postgres connected", "host", cfg.Postgres.Host, "port", cfg.Postgres.Port)
 
 	rdb, err := redis.Connect(initCtx, cfg.Redis)
 	if err != nil {
@@ -60,10 +56,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer kafkaClient.Close()
-	slog.Info("Kafka connected",
-		"brokers", cfg.Kafka.Brokers,
-		"topic", cfg.Kafka.TopicRuns,
-	)
+	slog.Info("Kafka connected", "brokers", cfg.Kafka.Brokers, "topic", cfg.Kafka.TopicRuns)
 
 	etcdClient, err := election.Connect(initCtx, cfg.Etcd)
 	if err != nil {
@@ -78,16 +71,23 @@ func main() {
 		return
 	}
 
-	// Create a Kafka writer keyed per-job for partition ordering.
+	// Writer for the main job_runs topic (used by scheduler + sweeper).
 	writer := kafkaClient.NewWriter(cfg.Kafka.TopicRuns)
 	defer writer.Close()
 
 	sched := scheduler.New(pgPool, 1*time.Second, writer)
 
+	// Sweeper polls every 5 seconds — fast enough for timely retries,
+	// slow enough to not hammer the DB.
+	sweeper := scheduler.NewSweeper(pgPool, writer, 5*time.Second)
+
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("Scheduler polling loop started. Press Ctrl+C / SIGTERM to stop.")
+	// Run the sweeper in a background goroutine alongside the main scheduler loop.
+	go sweeper.Run(runCtx)
+
+	slog.Info("Scheduler and retry sweeper started. Press Ctrl+C / SIGTERM to stop.")
 	if err := sched.Run(runCtx); err != nil {
 		slog.Error("Scheduler loop stopped with error", "error", err)
 		os.Exit(1)

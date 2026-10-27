@@ -17,16 +17,26 @@ type Querier interface {
 	// on restart it will attempt the same (job_id, scheduled_for) and get DO NOTHING.
 	// RETURNING id is NULL when a conflict occurs — the caller checks for this and skips (handles the idempotency case)
 	CreateRun(ctx context.Context, arg CreateRunParams) (pgtype.UUID, error)
+	// Transition a RUNNING run to RETRYING state after a failure.
+	// attempt is incremented by the caller before passing to avoid a round-trip.
+	FailRunForRetry(ctx context.Context, arg FailRunForRetryParams) error
 	// ordered by priority (lower = higher priority).
 	// FOR UPDATE SKIP LOCKED: if multiple scheduler instances run, each grabs a
 	// non-overlapping subset without blocking — standard Postgres advisory-locking pattern.
 	FetchDueJobs(ctx context.Context, limit int32) ([]Job, error)
+	// Fetch runs in RETRYING state whose next_retry_at has passed.
+	// FOR UPDATE SKIP LOCKED means concurrent sweeper instances each grab a disjoint subset.
+	FetchDueRetries(ctx context.Context, limit int32) ([]FetchDueRetriesRow, error)
 	FetchUnscheduledJobs(ctx context.Context) ([]FetchUnscheduledJobsRow, error)
-	// Mark run as SUCCEEDED or FAILED with the final error message.
+	// Mark run as SUCCEEDED with the final status.
 	FinishRun(ctx context.Context, arg FinishRunParams) error
 	GetJobByID(ctx context.Context, id pgtype.UUID) (Job, error)
 	GetRunByID(ctx context.Context, id pgtype.UUID) (JobRun, error)
 	ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) ([]JobRun, error)
+	// Transition a RUNNING run to DEAD (all retries exhausted).
+	MarkRunDead(ctx context.Context, arg MarkRunDeadParams) error
+	// Transition a RETRYING run back to QUEUED after the sweeper re-enqueues it.
+	MarkRunQueued(ctx context.Context, id pgtype.UUID) error
 	SetInitialNextRun(ctx context.Context, arg SetInitialNextRunParams) error
 }
 
