@@ -11,32 +11,35 @@ import (
 )
 
 type Querier interface {
-	// Always use the previous scheduled_for as the base (not now()) to avoid drifting the schedule on slow machines.
+	// Always use the computed next run as the base to advance the schedule.
 	AdvanceNextRun(ctx context.Context, arg AdvanceNextRunParams) error
-	// if scheduler crashes after advancing next_run_at but before finishing the run,
-	// on restart it will attempt the same (job_id, scheduled_for) and get DO NOTHING.
-	// RETURNING id is NULL when a conflict occurs — the caller checks for this and skips (handles the idempotency case)
+	// Atomically claim a run for execution when consumed by a worker.
+	// Transition from QUEUED to RUNNING and assign worker_id.
+	ClaimRun(ctx context.Context, arg ClaimRunParams) (ClaimRunRow, error)
+	// Atomically create a run with status PENDING within the scheduler's tick transaction.
+	// If a crash happens before advancing next_run_at or if two schedulers race,
+	// ON CONFLICT (job_id, scheduled_for) DO NOTHING prevents duplicate runs.
 	CreateRun(ctx context.Context, arg CreateRunParams) (pgtype.UUID, error)
-	// Transition a RUNNING run to RETRYING state after a failure.
-	// attempt is incremented by the caller before passing to avoid a round-trip.
-	FailRunForRetry(ctx context.Context, arg FailRunForRetryParams) error
+	// Transition run to RETRYING with fencing guard: must match current worker_id and attempt.
+	FailRunForRetry(ctx context.Context, arg FailRunForRetryParams) (int64, error)
 	// ordered by priority (lower = higher priority).
 	// FOR UPDATE SKIP LOCKED: if multiple scheduler instances run, each grabs a
 	// non-overlapping subset without blocking — standard Postgres advisory-locking pattern.
-	FetchDueJobs(ctx context.Context, limit int32) ([]Job, error)
-	// Fetch runs in RETRYING state whose next_retry_at has passed.
-	// FOR UPDATE SKIP LOCKED means concurrent sweeper instances each grab a disjoint subset.
+	FetchDueJobs(ctx context.Context, limit int32) ([]FetchDueJobsRow, error)
+	// Fetch runs ready to be retried (status = RETRYING and next_retry_at <= now()).
 	FetchDueRetries(ctx context.Context, limit int32) ([]FetchDueRetriesRow, error)
+	// Fetch runs that were committed as PENDING but never published to Kafka (older than 5s).
+	FetchStuckPendingRuns(ctx context.Context, limit int32) ([]FetchStuckPendingRunsRow, error)
 	FetchUnscheduledJobs(ctx context.Context) ([]FetchUnscheduledJobsRow, error)
-	// Mark run as SUCCEEDED with the final status.
-	FinishRun(ctx context.Context, arg FinishRunParams) error
-	GetJobByID(ctx context.Context, id pgtype.UUID) (Job, error)
-	GetRunByID(ctx context.Context, id pgtype.UUID) (JobRun, error)
-	ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) ([]JobRun, error)
-	// Transition a RUNNING run to DEAD (all retries exhausted).
-	MarkRunDead(ctx context.Context, arg MarkRunDeadParams) error
-	// Transition a RETRYING run back to QUEUED after the sweeper re-enqueues it.
-	MarkRunQueued(ctx context.Context, id pgtype.UUID) error
+	// Mark run as SUCCEEDED with fencing guard: must match current worker_id and attempt.
+	FinishRun(ctx context.Context, arg FinishRunParams) (int64, error)
+	GetJobByID(ctx context.Context, id pgtype.UUID) (GetJobByIDRow, error)
+	GetRunByID(ctx context.Context, id pgtype.UUID) (GetRunByIDRow, error)
+	ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) ([]ListRunsForJobRow, error)
+	// Transition a RUNNING run to DEAD when retries are exhausted, with fencing guard.
+	MarkRunDead(ctx context.Context, arg MarkRunDeadParams) (int64, error)
+	// Transition a PENDING or RETRYING run to QUEUED after successful Kafka publish.
+	MarkRunQueued(ctx context.Context, id pgtype.UUID) (int64, error)
 	SetInitialNextRun(ctx context.Context, arg SetInitialNextRunParams) error
 }
 

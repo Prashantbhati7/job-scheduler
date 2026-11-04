@@ -21,6 +21,7 @@ const (
 	JobRunStatusFAILED    JobRunStatus = "FAILED"
 	JobRunStatusRETRYING  JobRunStatus = "RETRYING"
 	JobRunStatusDEAD      JobRunStatus = "DEAD"
+	JobRunStatusCANCELLED JobRunStatus = "CANCELLED"
 )
 
 func (e *JobRunStatus) Scan(src interface{}) error {
@@ -101,19 +102,25 @@ func (ns NullWorkerStatus) Value() (driver.Value, error) {
 }
 
 type Job struct {
-	ID             pgtype.UUID        `db:"id" json:"id"`
-	Name           string             `db:"name" json:"name"`
-	CronExpr       string             `db:"cron_expr" json:"cron_expr"`
-	Timezone       string             `db:"timezone" json:"timezone"`
-	Payload        []byte             `db:"payload" json:"payload"`
-	Priority       int16              `db:"priority" json:"priority"`
-	MaxRetries     int32              `db:"max_retries" json:"max_retries"`
-	TimeoutSeconds int32              `db:"timeout_seconds" json:"timeout_seconds"`
-	Enabled        bool               `db:"enabled" json:"enabled"`
-	NextRunAt      pgtype.Timestamptz `db:"next_run_at" json:"next_run_at"`
-	CreatedAt      pgtype.Timestamptz `db:"created_at" json:"created_at"`
-	UpdatedAt      pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
-	DeletedAt      pgtype.Timestamptz `db:"deleted_at" json:"deleted_at"`
+	ID                  pgtype.UUID        `db:"id" json:"id"`
+	Name                string             `db:"name" json:"name"`
+	CronExpr            string             `db:"cron_expr" json:"cron_expr"`
+	Timezone            string             `db:"timezone" json:"timezone"`
+	Payload             []byte             `db:"payload" json:"payload"`
+	Priority            int16              `db:"priority" json:"priority"`
+	MaxRetries          int32              `db:"max_retries" json:"max_retries"`
+	TimeoutSeconds      int32              `db:"timeout_seconds" json:"timeout_seconds"`
+	Enabled             bool               `db:"enabled" json:"enabled"`
+	NextRunAt           pgtype.Timestamptz `db:"next_run_at" json:"next_run_at"`
+	CreatedAt           pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
+	DeletedAt           pgtype.Timestamptz `db:"deleted_at" json:"deleted_at"`
+	Handler             string             `db:"handler" json:"handler"`
+	MisfirePolicy       string             `db:"misfire_policy" json:"misfire_policy"`
+	OverlapPolicy       string             `db:"overlap_policy" json:"overlap_policy"`
+	MaxConcurrency      int32              `db:"max_concurrency" json:"max_concurrency"`
+	ConsecutiveFailures int32              `db:"consecutive_failures" json:"consecutive_failures"`
+	OwnerID             pgtype.UUID        `db:"owner_id" json:"owner_id"`
 }
 
 type JobRun struct {
@@ -129,6 +136,8 @@ type JobRun struct {
 	FinishedAt   pgtype.Timestamptz `db:"finished_at" json:"finished_at"`
 	Error        *string            `db:"error" json:"error"`
 	CreatedAt    pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	TriggerType  string             `db:"trigger_type" json:"trigger_type"`
+	CancelledAt  pgtype.Timestamptz `db:"cancelled_at" json:"cancelled_at"`
 }
 
 type RunLog struct {

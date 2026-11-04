@@ -24,14 +24,17 @@ type AdvanceNextRunParams struct {
 	NextRunAt pgtype.Timestamptz `db:"next_run_at" json:"next_run_at"`
 }
 
-// Always use the previous scheduled_for as the base (not now()) to avoid drifting the schedule on slow machines.
+// Always use the computed next run as the base to advance the schedule.
 func (q *Queries) AdvanceNextRun(ctx context.Context, arg AdvanceNextRunParams) error {
 	_, err := q.db.Exec(ctx, advanceNextRun, arg.ID, arg.NextRunAt)
 	return err
 }
 
 const fetchDueJobs = `-- name: FetchDueJobs :many
-SELECT id, name, cron_expr,timezone, payload, priority, max_retries,timeout_seconds, enabled, next_run_at, created_at, updated_at,  deleted_at
+SELECT
+    id, name, cron_expr, timezone, payload, priority, max_retries, timeout_seconds,
+    enabled, next_run_at, handler, misfire_policy, overlap_policy, max_concurrency,
+    consecutive_failures, owner_id, created_at, updated_at, deleted_at
 FROM jobs
 WHERE
     enabled = true
@@ -42,18 +45,40 @@ LIMIT $1
 FOR UPDATE SKIP LOCKED
 `
 
+type FetchDueJobsRow struct {
+	ID                  pgtype.UUID        `db:"id" json:"id"`
+	Name                string             `db:"name" json:"name"`
+	CronExpr            string             `db:"cron_expr" json:"cron_expr"`
+	Timezone            string             `db:"timezone" json:"timezone"`
+	Payload             []byte             `db:"payload" json:"payload"`
+	Priority            int16              `db:"priority" json:"priority"`
+	MaxRetries          int32              `db:"max_retries" json:"max_retries"`
+	TimeoutSeconds      int32              `db:"timeout_seconds" json:"timeout_seconds"`
+	Enabled             bool               `db:"enabled" json:"enabled"`
+	NextRunAt           pgtype.Timestamptz `db:"next_run_at" json:"next_run_at"`
+	Handler             string             `db:"handler" json:"handler"`
+	MisfirePolicy       string             `db:"misfire_policy" json:"misfire_policy"`
+	OverlapPolicy       string             `db:"overlap_policy" json:"overlap_policy"`
+	MaxConcurrency      int32              `db:"max_concurrency" json:"max_concurrency"`
+	ConsecutiveFailures int32              `db:"consecutive_failures" json:"consecutive_failures"`
+	OwnerID             pgtype.UUID        `db:"owner_id" json:"owner_id"`
+	CreatedAt           pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
+	DeletedAt           pgtype.Timestamptz `db:"deleted_at" json:"deleted_at"`
+}
+
 // ordered by priority (lower = higher priority).
 // FOR UPDATE SKIP LOCKED: if multiple scheduler instances run, each grabs a
 // non-overlapping subset without blocking — standard Postgres advisory-locking pattern.
-func (q *Queries) FetchDueJobs(ctx context.Context, limit int32) ([]Job, error) {
+func (q *Queries) FetchDueJobs(ctx context.Context, limit int32) ([]FetchDueJobsRow, error) {
 	rows, err := q.db.Query(ctx, fetchDueJobs, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Job{}
+	items := []FetchDueJobsRow{}
 	for rows.Next() {
-		var i Job
+		var i FetchDueJobsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Name,
@@ -65,6 +90,12 @@ func (q *Queries) FetchDueJobs(ctx context.Context, limit int32) ([]Job, error) 
 			&i.TimeoutSeconds,
 			&i.Enabled,
 			&i.NextRunAt,
+			&i.Handler,
+			&i.MisfirePolicy,
+			&i.OverlapPolicy,
+			&i.MaxConcurrency,
+			&i.ConsecutiveFailures,
+			&i.OwnerID,
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeletedAt,
@@ -114,14 +145,39 @@ func (q *Queries) FetchUnscheduledJobs(ctx context.Context) ([]FetchUnscheduledJ
 }
 
 const getJobByID = `-- name: GetJobByID :one
-SELECT id, name, cron_expr, timezone, payload, priority, max_retries, timeout_seconds, enabled, next_run_at, created_at, updated_at, deleted_at
+SELECT
+    id, name, cron_expr, timezone, payload, priority, max_retries, timeout_seconds,
+    enabled, next_run_at, handler, misfire_policy, overlap_policy, max_concurrency,
+    consecutive_failures, owner_id, created_at, updated_at, deleted_at
 FROM jobs
 WHERE id = $1 AND deleted_at IS NULL
 `
 
-func (q *Queries) GetJobByID(ctx context.Context, id pgtype.UUID) (Job, error) {
+type GetJobByIDRow struct {
+	ID                  pgtype.UUID        `db:"id" json:"id"`
+	Name                string             `db:"name" json:"name"`
+	CronExpr            string             `db:"cron_expr" json:"cron_expr"`
+	Timezone            string             `db:"timezone" json:"timezone"`
+	Payload             []byte             `db:"payload" json:"payload"`
+	Priority            int16              `db:"priority" json:"priority"`
+	MaxRetries          int32              `db:"max_retries" json:"max_retries"`
+	TimeoutSeconds      int32              `db:"timeout_seconds" json:"timeout_seconds"`
+	Enabled             bool               `db:"enabled" json:"enabled"`
+	NextRunAt           pgtype.Timestamptz `db:"next_run_at" json:"next_run_at"`
+	Handler             string             `db:"handler" json:"handler"`
+	MisfirePolicy       string             `db:"misfire_policy" json:"misfire_policy"`
+	OverlapPolicy       string             `db:"overlap_policy" json:"overlap_policy"`
+	MaxConcurrency      int32              `db:"max_concurrency" json:"max_concurrency"`
+	ConsecutiveFailures int32              `db:"consecutive_failures" json:"consecutive_failures"`
+	OwnerID             pgtype.UUID        `db:"owner_id" json:"owner_id"`
+	CreatedAt           pgtype.Timestamptz `db:"created_at" json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `db:"updated_at" json:"updated_at"`
+	DeletedAt           pgtype.Timestamptz `db:"deleted_at" json:"deleted_at"`
+}
+
+func (q *Queries) GetJobByID(ctx context.Context, id pgtype.UUID) (GetJobByIDRow, error) {
 	row := q.db.QueryRow(ctx, getJobByID, id)
-	var i Job
+	var i GetJobByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.Name,
@@ -133,6 +189,12 @@ func (q *Queries) GetJobByID(ctx context.Context, id pgtype.UUID) (Job, error) {
 		&i.TimeoutSeconds,
 		&i.Enabled,
 		&i.NextRunAt,
+		&i.Handler,
+		&i.MisfirePolicy,
+		&i.OverlapPolicy,
+		&i.MaxConcurrency,
+		&i.ConsecutiveFailures,
+		&i.OwnerID,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeletedAt,
@@ -145,7 +207,7 @@ UPDATE jobs
 SET
     next_run_at = $2,
     updated_at  = now()
-    WHERE id = $1 AND next_run_at IS NULL
+WHERE id = $1 AND next_run_at IS NULL
 `
 
 type SetInitialNextRunParams struct {

@@ -20,16 +20,20 @@ import (
 
 type Handler func(ctx context.Context, msg *kafka.JobMessage) error
 
+type KafkaWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafkago.Message) error
+}
+
 type Consumer struct {
 	reader    *kafkago.Reader
-	dlqWriter *kafkago.Writer // publishes exhausted runs to the DLQ topic
+	dlqWriter KafkaWriter // publishes exhausted runs to the DLQ topic
 	pool      *pgxpool.Pool
 	queries   db.Querier
 	handler   Handler
 	workerID  string
 }
 
-func New(reader *kafkago.Reader, dlqWriter *kafkago.Writer, pool *pgxpool.Pool, handler Handler) *Consumer {
+func New(reader *kafkago.Reader, dlqWriter KafkaWriter, pool *pgxpool.Pool, handler Handler) *Consumer {
 	return &Consumer{
 		reader:    reader,
 		dlqWriter: dlqWriter,
@@ -40,7 +44,7 @@ func New(reader *kafkago.Reader, dlqWriter *kafkago.Writer, pool *pgxpool.Pool, 
 	}
 }
 
-func NewWithQuerier(reader *kafkago.Reader, dlqWriter *kafkago.Writer, pool *pgxpool.Pool, queries db.Querier, handler Handler) *Consumer {
+func NewWithQuerier(reader *kafkago.Reader, dlqWriter KafkaWriter, pool *pgxpool.Pool, queries db.Querier, handler Handler) *Consumer {
 	return &Consumer{
 		reader:    reader,
 		dlqWriter: dlqWriter,
@@ -94,9 +98,16 @@ func (c *Consumer) Run(ctx context.Context) error {
 			"worker_id", c.workerID,
 		)
 
-		c.executeAndPersist(ctx, msg)
+		persisted := c.executeAndPersist(ctx, msg)
+		if !persisted {
+			slog.Error("Failed to persist run state after retries — NOT committing offset to allow redelivery",
+				"run_id", msg.RunID,
+				"job_id", msg.JobID,
+			)
+			continue
+		}
 
-		// Commit offset after DB is updated — at-least-once delivery guarantee.
+		// Commit offset strictly AFTER DB persistence succeeds — at-least-once delivery guarantee.
 		if err := c.reader.CommitMessages(ctx, kafkaMsg); err != nil {
 			slog.Error("Failed to commit Kafka offset",
 				"run_id", msg.RunID,
@@ -106,15 +117,34 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 }
 
-func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage) {
+func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage) bool {
 	runID, err := parseUUID(msg.RunID)
 	if err != nil {
-		slog.Error("Invalid run_id in message — cannot persist result",
+		slog.Error("Invalid run_id in message — skipping malformed run",
 			"run_id", msg.RunID,
 			"error", err,
 		)
-		return
+		return true // Skip and commit offset so we don't poison loop on unparseable UUID
 	}
+
+	// 1. Claim run: transition QUEUED -> RUNNING and record worker_id
+	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer claimCancel()
+
+	claim, err := c.queries.ClaimRun(claimCtx, db.ClaimRunParams{
+		ID:       runID,
+		WorkerID: &c.workerID,
+	})
+	if err != nil {
+		slog.Info("Run could not be claimed (already running or terminal) — skipping",
+			"run_id", msg.RunID,
+			"worker_id", c.workerID,
+			"error", err,
+		)
+		return true // Return true to commit offset for duplicate/stale messages
+	}
+
+	_ = claim
 
 	timeout := time.Duration(msg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -126,12 +156,11 @@ func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage)
 	handlerErr := c.runSafe(handlerCtx, msg)
 
 	if handlerErr == nil {
-		// Happy path: mark succeeded.
-		c.finishSucceeded(ctx, runID, msg)
-		return
+		// Happy path: mark succeeded
+		return c.finishSucceededWithRetry(ctx, runID, msg)
 	}
 
-	// Failure path: decide between retry and dead-letter.
+	// Failure path: decide between retry and dead-letter
 	nextAttempt := msg.Attempt + 1
 
 	slog.Warn("Job handler failed",
@@ -139,87 +168,145 @@ func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage)
 		"job_id", msg.JobID,
 		"job_name", msg.JobName,
 		"attempt", msg.Attempt,
+		"next_attempt", nextAttempt,
 		"max_retries", msg.MaxRetries,
 		"error", handlerErr,
 	)
 
-	if nextAttempt < msg.MaxRetries {
-		// More retries allowed — schedule next attempt with backoff.
-		c.scheduleRetry(ctx, runID, msg, nextAttempt, handlerErr)
-	} else {
-		// All retries exhausted — dead-letter the run.
-		c.deadLetter(ctx, runID, msg, handlerErr)
+	// Decision 11: total executions = 1 + max_retries, so retry if nextAttempt <= max_retries
+	if nextAttempt <= msg.MaxRetries {
+		return c.scheduleRetryWithRetry(ctx, runID, msg, nextAttempt, handlerErr)
 	}
+
+	return c.deadLetterWithRetry(ctx, runID, msg, handlerErr)
 }
 
-// finishSucceeded marks the run as SUCCEEDED in the DB.
-func (c *Consumer) finishSucceeded(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage) {
-	finishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+func (c *Consumer) finishSucceededWithRetry(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage) bool {
+	for i := 0; i < 3; i++ {
+		finishCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		rows, err := c.queries.FinishRun(finishCtx, db.FinishRunParams{
+			ID:       runID,
+			Status:   db.JobRunStatusSUCCEEDED,
+			Error:    nil,
+			WorkerID: &c.workerID,
+			Attempt:  msg.Attempt,
+		})
+		cancel()
 
-	if err := c.queries.FinishRun(finishCtx, db.FinishRunParams{
-		ID:     runID,
-		Status: db.JobRunStatusSUCCEEDED,
-		Error:  nil,
-	}); err != nil {
-		slog.Error("Failed to mark run SUCCEEDED", "run_id", msg.RunID, "error", err)
-		return
+		if err == nil {
+			if rows == 0 {
+				slog.Warn("FinishRun affected 0 rows (fencing prevented zombie write)",
+					"run_id", msg.RunID,
+					"worker_id", c.workerID,
+					"attempt", msg.Attempt,
+				)
+			} else {
+				slog.Info("Run SUCCEEDED",
+					"run_id", msg.RunID,
+					"job_name", msg.JobName,
+					"attempt", msg.Attempt,
+					"worker_id", c.workerID,
+				)
+			}
+			return true
+		}
+
+		slog.Warn("Failed to mark run SUCCEEDED — retrying DB write",
+			"run_id", msg.RunID,
+			"retry_attempt", i+1,
+			"error", err,
+		)
+		time.Sleep(100 * time.Millisecond)
 	}
-	slog.Info("Run SUCCEEDED",
-		"run_id", msg.RunID,
-		"job_name", msg.JobName,
-		"attempt", msg.Attempt,
-	)
+	return false
 }
 
-// scheduleRetry transitions the run to RETRYING and writes next_retry_at.
-// The sweeper (in scheduler/sweeper.go) re-enqueues it to Kafka when the delay elapses.
-func (c *Consumer) scheduleRetry(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage, nextAttempt int32, cause error) {
-	// Full jitter exponential backoff — desynchronizes retries after bulk failures.
+func (c *Consumer) scheduleRetryWithRetry(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage, nextAttempt int32, cause error) bool {
 	nextRetryAt := retry.NextRetryAt(nextAttempt, retry.DefaultBase, retry.DefaultMaxCap)
 	errStr := cause.Error()
 
-	retryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	for i := 0; i < 3; i++ {
+		retryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		rows, err := c.queries.FailRunForRetry(retryCtx, db.FailRunForRetryParams{
+			ID:             runID,
+			NewAttempt:     nextAttempt,
+			NextRetryAt:    pgtype.Timestamptz{Time: nextRetryAt, Valid: true},
+			Error:          &errStr,
+			WorkerID:       &c.workerID,
+			CurrentAttempt: msg.Attempt,
+		})
+		cancel()
 
-	if err := c.queries.FailRunForRetry(retryCtx, db.FailRunForRetryParams{
-		ID:          runID,
-		Attempt:     nextAttempt,
-		NextRetryAt: pgtype.Timestamptz{Time: nextRetryAt, Valid: true},
-		Error:       &errStr,
-	}); err != nil {
-		slog.Error("Failed to schedule retry in DB", "run_id", msg.RunID, "error", err)
-		return
+		if err == nil {
+			if rows == 0 {
+				slog.Warn("FailRunForRetry affected 0 rows (fencing prevented zombie write)",
+					"run_id", msg.RunID,
+					"worker_id", c.workerID,
+					"attempt", msg.Attempt,
+				)
+			} else {
+				slog.Warn("Run scheduled for retry (RETRYING)",
+					"run_id", msg.RunID,
+					"job_name", msg.JobName,
+					"attempt", msg.Attempt,
+					"next_attempt", nextAttempt,
+					"max_retries", msg.MaxRetries,
+					"next_retry_at", nextRetryAt.Format(time.RFC3339),
+					"cause", cause,
+				)
+			}
+			return true
+		}
+
+		slog.Warn("Failed to schedule retry in DB — retrying DB write",
+			"run_id", msg.RunID,
+			"retry_attempt", i+1,
+			"error", err,
+		)
+		time.Sleep(100 * time.Millisecond)
 	}
-
-	slog.Warn("Run scheduled for retry (RETRYING)",
-		"run_id", msg.RunID,
-		"job_name", msg.JobName,
-		"attempt", msg.Attempt,
-		"next_attempt", nextAttempt,
-		"max_retries", msg.MaxRetries,
-		"next_retry_at", nextRetryAt.Format(time.RFC3339),
-		"cause", cause,
-	)
+	return false
 }
 
-// deadLetter marks the run as DEAD in Postgres and publishes a DeadLetterMessage
-// to the DLQ topic so operators can inspect or replay it.
-func (c *Consumer) deadLetter(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage, cause error) {
+func (c *Consumer) deadLetterWithRetry(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage, cause error) bool {
 	errStr := cause.Error()
 
-	deadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	dbSuccess := false
+	for i := 0; i < 3; i++ {
+		deadCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		rows, err := c.queries.MarkRunDead(deadCtx, db.MarkRunDeadParams{
+			ID:       runID,
+			Error:    &errStr,
+			WorkerID: &c.workerID,
+			Attempt:  msg.Attempt,
+		})
+		cancel()
 
-	if err := c.queries.MarkRunDead(deadCtx, db.MarkRunDeadParams{
-		ID:    runID,
-		Error: &errStr,
-	}); err != nil {
-		slog.Error("Failed to mark run DEAD in DB", "run_id", msg.RunID, "error", err)
-		return
+		if err == nil {
+			if rows == 0 {
+				slog.Warn("MarkRunDead affected 0 rows (fencing prevented zombie write)",
+					"run_id", msg.RunID,
+					"worker_id", c.workerID,
+					"attempt", msg.Attempt,
+				)
+			}
+			dbSuccess = true
+			break
+		}
+
+		slog.Warn("Failed to mark run DEAD in DB — retrying DB write",
+			"run_id", msg.RunID,
+			"retry_attempt", i+1,
+			"error", err,
+		)
+		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Publish to DLQ for operator visibility / replay.
+	if !dbSuccess {
+		return false
+	}
+
+	// Publish to DLQ for operator visibility / replay
 	dlq := &kafka.DeadLetterMessage{
 		Version:      kafka.CurrentVersion,
 		OriginalMsg:  *msg,
@@ -250,6 +337,8 @@ func (c *Consumer) deadLetter(ctx context.Context, runID pgtype.UUID, msg *kafka
 		"max_retries", msg.MaxRetries,
 		"cause", cause,
 	)
+
+	return true
 }
 
 func (c *Consumer) runSafe(ctx context.Context, msg *kafka.JobMessage) (retErr error) {
@@ -278,7 +367,6 @@ func workerIDFromEnv() string {
 }
 
 // ExecuteAndPersistForTest exposes executeAndPersist for white-box unit testing.
-// It is intentionally unexported from the consumer_test package via the _test suffix trick.
-func (c *Consumer) ExecuteAndPersistForTest(ctx context.Context, msg *kafka.JobMessage) {
-	c.executeAndPersist(ctx, msg)
+func (c *Consumer) ExecuteAndPersistForTest(ctx context.Context, msg *kafka.JobMessage) bool {
+	return c.executeAndPersist(ctx, msg)
 }

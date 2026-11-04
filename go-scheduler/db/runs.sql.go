@@ -11,9 +11,49 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimRun = `-- name: ClaimRun :one
+UPDATE job_runs
+SET
+    status     = 'RUNNING',
+    worker_id  = $2,
+    started_at = now()
+WHERE id = $1 AND status = 'QUEUED'
+RETURNING id, job_id, scheduled_for, status, attempt, worker_id
+`
+
+type ClaimRunParams struct {
+	ID       pgtype.UUID `db:"id" json:"id"`
+	WorkerID *string     `db:"worker_id" json:"worker_id"`
+}
+
+type ClaimRunRow struct {
+	ID           pgtype.UUID        `db:"id" json:"id"`
+	JobID        pgtype.UUID        `db:"job_id" json:"job_id"`
+	ScheduledFor pgtype.Timestamptz `db:"scheduled_for" json:"scheduled_for"`
+	Status       JobRunStatus       `db:"status" json:"status"`
+	Attempt      int32              `db:"attempt" json:"attempt"`
+	WorkerID     *string            `db:"worker_id" json:"worker_id"`
+}
+
+// Atomically claim a run for execution when consumed by a worker.
+// Transition from QUEUED to RUNNING and assign worker_id.
+func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (ClaimRunRow, error) {
+	row := q.db.QueryRow(ctx, claimRun, arg.ID, arg.WorkerID)
+	var i ClaimRunRow
+	err := row.Scan(
+		&i.ID,
+		&i.JobID,
+		&i.ScheduledFor,
+		&i.Status,
+		&i.Attempt,
+		&i.WorkerID,
+	)
+	return i, err
+}
+
 const createRun = `-- name: CreateRun :one
-INSERT INTO job_runs ( job_id, scheduled_for, status, started_at, created_at) 
-VALUES ( $1,$2, 'RUNNING', now(), now())
+INSERT INTO job_runs (job_id, scheduled_for, status, created_at)
+VALUES ($1, $2, 'PENDING', now())
 ON CONFLICT (job_id, scheduled_for) DO NOTHING
 RETURNING id
 `
@@ -23,9 +63,9 @@ type CreateRunParams struct {
 	ScheduledFor pgtype.Timestamptz `db:"scheduled_for" json:"scheduled_for"`
 }
 
-// if scheduler crashes after advancing next_run_at but before finishing the run,
-// on restart it will attempt the same (job_id, scheduled_for) and get DO NOTHING.
-// RETURNING id is NULL when a conflict occurs — the caller checks for this and skips (handles the idempotency case)
+// Atomically create a run with status PENDING within the scheduler's tick transaction.
+// If a crash happens before advancing next_run_at or if two schedulers race,
+// ON CONFLICT (job_id, scheduled_for) DO NOTHING prevents duplicate runs.
 func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (pgtype.UUID, error) {
 	row := q.db.QueryRow(ctx, createRun, arg.JobID, arg.ScheduledFor)
 	var id pgtype.UUID
@@ -33,34 +73,43 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (pgtype.UU
 	return id, err
 }
 
-const failRunForRetry = `-- name: FailRunForRetry :exec
+const failRunForRetry = `-- name: FailRunForRetry :execrows
 UPDATE job_runs
 SET
-    status       = 'RETRYING',
-    attempt      = $2,
-    next_retry_at = $3,
-    error        = $4,
-    finished_at  = NULL
-WHERE id = $1
+    status        = 'RETRYING',
+    attempt       = $1,
+    next_retry_at = $2,
+    error         = $3,
+    finished_at   = NULL
+WHERE id = $4
+  AND status = 'RUNNING'
+  AND worker_id = $5
+  AND attempt = $6
 `
 
 type FailRunForRetryParams struct {
-	ID          pgtype.UUID        `db:"id" json:"id"`
-	Attempt     int32              `db:"attempt" json:"attempt"`
-	NextRetryAt pgtype.Timestamptz `db:"next_retry_at" json:"next_retry_at"`
-	Error       *string            `db:"error" json:"error"`
+	NewAttempt     int32              `db:"new_attempt" json:"new_attempt"`
+	NextRetryAt    pgtype.Timestamptz `db:"next_retry_at" json:"next_retry_at"`
+	Error          *string            `db:"error" json:"error"`
+	ID             pgtype.UUID        `db:"id" json:"id"`
+	WorkerID       *string            `db:"worker_id" json:"worker_id"`
+	CurrentAttempt int32              `db:"current_attempt" json:"current_attempt"`
 }
 
-// Transition a RUNNING run to RETRYING state after a failure.
-// attempt is incremented by the caller before passing to avoid a round-trip.
-func (q *Queries) FailRunForRetry(ctx context.Context, arg FailRunForRetryParams) error {
-	_, err := q.db.Exec(ctx, failRunForRetry,
-		arg.ID,
-		arg.Attempt,
+// Transition run to RETRYING with fencing guard: must match current worker_id and attempt.
+func (q *Queries) FailRunForRetry(ctx context.Context, arg FailRunForRetryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failRunForRetry,
+		arg.NewAttempt,
 		arg.NextRetryAt,
 		arg.Error,
+		arg.ID,
+		arg.WorkerID,
+		arg.CurrentAttempt,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const fetchDueRetries = `-- name: FetchDueRetries :many
@@ -102,8 +151,7 @@ type FetchDueRetriesRow struct {
 	TimeoutSeconds int32              `db:"timeout_seconds" json:"timeout_seconds"`
 }
 
-// Fetch runs in RETRYING state whose next_retry_at has passed.
-// FOR UPDATE SKIP LOCKED means concurrent sweeper instances each grab a disjoint subset.
+// Fetch runs ready to be retried (status = RETRYING and next_retry_at <= now()).
 func (q *Queries) FetchDueRetries(ctx context.Context, limit int32) ([]FetchDueRetriesRow, error) {
 	rows, err := q.db.Query(ctx, fetchDueRetries, limit)
 	if err != nil {
@@ -137,25 +185,112 @@ func (q *Queries) FetchDueRetries(ctx context.Context, limit int32) ([]FetchDueR
 	return items, nil
 }
 
-const finishRun = `-- name: FinishRun :exec
+const fetchStuckPendingRuns = `-- name: FetchStuckPendingRuns :many
+SELECT
+    r.id,
+    r.job_id,
+    r.scheduled_for,
+    r.status,
+    r.attempt,
+    r.error,
+    j.name        AS job_name,
+    j.cron_expr   AS cron_expr,
+    j.timezone    AS timezone,
+    j.payload     AS payload,
+    j.max_retries AS max_retries,
+    j.timeout_seconds AS timeout_seconds
+FROM job_runs r
+JOIN jobs j ON r.job_id = j.id
+WHERE r.status = 'PENDING'
+  AND r.created_at <= (now() - interval '5 seconds')
+  AND j.deleted_at IS NULL
+ORDER BY r.created_at ASC
+LIMIT $1
+FOR UPDATE OF r SKIP LOCKED
+`
+
+type FetchStuckPendingRunsRow struct {
+	ID             pgtype.UUID        `db:"id" json:"id"`
+	JobID          pgtype.UUID        `db:"job_id" json:"job_id"`
+	ScheduledFor   pgtype.Timestamptz `db:"scheduled_for" json:"scheduled_for"`
+	Status         JobRunStatus       `db:"status" json:"status"`
+	Attempt        int32              `db:"attempt" json:"attempt"`
+	Error          *string            `db:"error" json:"error"`
+	JobName        string             `db:"job_name" json:"job_name"`
+	CronExpr       string             `db:"cron_expr" json:"cron_expr"`
+	Timezone       string             `db:"timezone" json:"timezone"`
+	Payload        []byte             `db:"payload" json:"payload"`
+	MaxRetries     int32              `db:"max_retries" json:"max_retries"`
+	TimeoutSeconds int32              `db:"timeout_seconds" json:"timeout_seconds"`
+}
+
+// Fetch runs that were committed as PENDING but never published to Kafka (older than 5s).
+func (q *Queries) FetchStuckPendingRuns(ctx context.Context, limit int32) ([]FetchStuckPendingRunsRow, error) {
+	rows, err := q.db.Query(ctx, fetchStuckPendingRuns, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []FetchStuckPendingRunsRow{}
+	for rows.Next() {
+		var i FetchStuckPendingRunsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.JobID,
+			&i.ScheduledFor,
+			&i.Status,
+			&i.Attempt,
+			&i.Error,
+			&i.JobName,
+			&i.CronExpr,
+			&i.Timezone,
+			&i.Payload,
+			&i.MaxRetries,
+			&i.TimeoutSeconds,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const finishRun = `-- name: FinishRun :execrows
 UPDATE job_runs
 SET
     status      = $2,
     finished_at = now(),
     error       = $3
 WHERE id = $1
+  AND status = 'RUNNING'
+  AND worker_id = $4
+  AND attempt = $5
 `
 
 type FinishRunParams struct {
-	ID     pgtype.UUID  `db:"id" json:"id"`
-	Status JobRunStatus `db:"status" json:"status"`
-	Error  *string      `db:"error" json:"error"`
+	ID       pgtype.UUID  `db:"id" json:"id"`
+	Status   JobRunStatus `db:"status" json:"status"`
+	Error    *string      `db:"error" json:"error"`
+	WorkerID *string      `db:"worker_id" json:"worker_id"`
+	Attempt  int32        `db:"attempt" json:"attempt"`
 }
 
-// Mark run as SUCCEEDED with the final status.
-func (q *Queries) FinishRun(ctx context.Context, arg FinishRunParams) error {
-	_, err := q.db.Exec(ctx, finishRun, arg.ID, arg.Status, arg.Error)
-	return err
+// Mark run as SUCCEEDED with fencing guard: must match current worker_id and attempt.
+func (q *Queries) FinishRun(ctx context.Context, arg FinishRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishRun,
+		arg.ID,
+		arg.Status,
+		arg.Error,
+		arg.WorkerID,
+		arg.Attempt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getRunByID = `-- name: GetRunByID :one
@@ -164,9 +299,24 @@ FROM job_runs
 WHERE id = $1
 `
 
-func (q *Queries) GetRunByID(ctx context.Context, id pgtype.UUID) (JobRun, error) {
+type GetRunByIDRow struct {
+	ID           pgtype.UUID        `db:"id" json:"id"`
+	JobID        pgtype.UUID        `db:"job_id" json:"job_id"`
+	ScheduledFor pgtype.Timestamptz `db:"scheduled_for" json:"scheduled_for"`
+	Status       JobRunStatus       `db:"status" json:"status"`
+	Attempt      int32              `db:"attempt" json:"attempt"`
+	WorkerID     *string            `db:"worker_id" json:"worker_id"`
+	NextRetryAt  pgtype.Timestamptz `db:"next_retry_at" json:"next_retry_at"`
+	QueuedAt     pgtype.Timestamptz `db:"queued_at" json:"queued_at"`
+	StartedAt    pgtype.Timestamptz `db:"started_at" json:"started_at"`
+	FinishedAt   pgtype.Timestamptz `db:"finished_at" json:"finished_at"`
+	Error        *string            `db:"error" json:"error"`
+	CreatedAt    pgtype.Timestamptz `db:"created_at" json:"created_at"`
+}
+
+func (q *Queries) GetRunByID(ctx context.Context, id pgtype.UUID) (GetRunByIDRow, error) {
 	row := q.db.QueryRow(ctx, getRunByID, id)
-	var i JobRun
+	var i GetRunByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.JobID,
@@ -197,15 +347,30 @@ type ListRunsForJobParams struct {
 	Limit int32       `db:"limit" json:"limit"`
 }
 
-func (q *Queries) ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) ([]JobRun, error) {
+type ListRunsForJobRow struct {
+	ID           pgtype.UUID        `db:"id" json:"id"`
+	JobID        pgtype.UUID        `db:"job_id" json:"job_id"`
+	ScheduledFor pgtype.Timestamptz `db:"scheduled_for" json:"scheduled_for"`
+	Status       JobRunStatus       `db:"status" json:"status"`
+	Attempt      int32              `db:"attempt" json:"attempt"`
+	WorkerID     *string            `db:"worker_id" json:"worker_id"`
+	NextRetryAt  pgtype.Timestamptz `db:"next_retry_at" json:"next_retry_at"`
+	QueuedAt     pgtype.Timestamptz `db:"queued_at" json:"queued_at"`
+	StartedAt    pgtype.Timestamptz `db:"started_at" json:"started_at"`
+	FinishedAt   pgtype.Timestamptz `db:"finished_at" json:"finished_at"`
+	Error        *string            `db:"error" json:"error"`
+	CreatedAt    pgtype.Timestamptz `db:"created_at" json:"created_at"`
+}
+
+func (q *Queries) ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) ([]ListRunsForJobRow, error) {
 	rows, err := q.db.Query(ctx, listRunsForJob, arg.JobID, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []JobRun{}
+	items := []ListRunsForJobRow{}
 	for rows.Next() {
-		var i JobRun
+		var i ListRunsForJobRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.JobID,
@@ -230,37 +395,53 @@ func (q *Queries) ListRunsForJob(ctx context.Context, arg ListRunsForJobParams) 
 	return items, nil
 }
 
-const markRunDead = `-- name: MarkRunDead :exec
+const markRunDead = `-- name: MarkRunDead :execrows
 UPDATE job_runs
 SET
     status      = 'DEAD',
     finished_at = now(),
     error       = $2
 WHERE id = $1
+  AND status = 'RUNNING'
+  AND worker_id = $3
+  AND attempt = $4
 `
 
 type MarkRunDeadParams struct {
-	ID    pgtype.UUID `db:"id" json:"id"`
-	Error *string     `db:"error" json:"error"`
+	ID       pgtype.UUID `db:"id" json:"id"`
+	Error    *string     `db:"error" json:"error"`
+	WorkerID *string     `db:"worker_id" json:"worker_id"`
+	Attempt  int32       `db:"attempt" json:"attempt"`
 }
 
-// Transition a RUNNING run to DEAD (all retries exhausted).
-func (q *Queries) MarkRunDead(ctx context.Context, arg MarkRunDeadParams) error {
-	_, err := q.db.Exec(ctx, markRunDead, arg.ID, arg.Error)
-	return err
+// Transition a RUNNING run to DEAD when retries are exhausted, with fencing guard.
+func (q *Queries) MarkRunDead(ctx context.Context, arg MarkRunDeadParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markRunDead,
+		arg.ID,
+		arg.Error,
+		arg.WorkerID,
+		arg.Attempt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
-const markRunQueued = `-- name: MarkRunQueued :exec
+const markRunQueued = `-- name: MarkRunQueued :execrows
 UPDATE job_runs
 SET
-    status        = 'RUNNING',
-    next_retry_at = NULL,
-    started_at    = now()
-WHERE id = $1
+    status        = 'QUEUED',
+    queued_at     = now(),
+    next_retry_at = NULL
+WHERE id = $1 AND status IN ('PENDING', 'RETRYING')
 `
 
-// Transition a RETRYING run back to QUEUED after the sweeper re-enqueues it.
-func (q *Queries) MarkRunQueued(ctx context.Context, id pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, markRunQueued, id)
-	return err
+// Transition a PENDING or RETRYING run to QUEUED after successful Kafka publish.
+func (q *Queries) MarkRunQueued(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markRunQueued, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

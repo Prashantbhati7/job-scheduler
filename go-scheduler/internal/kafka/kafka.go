@@ -65,7 +65,9 @@ func (c *Client) NewWriter(topic string) *kafka.Writer {
 	return &kafka.Writer{
 		Addr:         kafka.TCP(c.cfg.Brokers...),
 		Topic:        topic,
-		Balancer:     &kafka.LeastBytes{},
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: kafka.RequireAll,
+		BatchTimeout: 10 * time.Millisecond,
 		WriteTimeout: 10 * time.Second,
 		ReadTimeout:  10 * time.Second,
 	}
@@ -76,9 +78,10 @@ func (c *Client) NewReader(topic, groupID string) *kafka.Reader {
 		Brokers:        c.cfg.Brokers,
 		Topic:          topic,
 		GroupID:        groupID,
-		MinBytes:       10e3, // 10KB
+		MinBytes:       1,
 		MaxBytes:       10e6, // 10MB
-		CommitInterval: time.Second,
+		MaxWait:        500 * time.Millisecond,
+		CommitInterval: 0, // Disable auto-commit; commit strictly after DB persistence
 		Dialer: &kafka.Dialer{
 			Timeout: 10 * time.Second,
 		},
