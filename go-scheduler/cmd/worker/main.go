@@ -79,7 +79,9 @@ func main() {
 	dlqWriter := kafkaClient.NewWriter(cfg.Kafka.TopicDLQ)
 	defer dlqWriter.Close()
 
-	consumer := worker.New(reader, dlqWriter, pgPool, worker.DefaultHandler)
+	locker := redis.NewLocker(rdb)
+
+	consumer := worker.New(reader, dlqWriter, pgPool, locker, worker.DefaultHandler)
 
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

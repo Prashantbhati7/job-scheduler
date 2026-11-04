@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/db"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/kafka"
+	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/redis"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/retry"
 )
 
@@ -29,27 +31,30 @@ type Consumer struct {
 	dlqWriter KafkaWriter // publishes exhausted runs to the DLQ topic
 	pool      *pgxpool.Pool
 	queries   db.Querier
+	locker    redis.Locker
 	handler   Handler
 	workerID  string
 }
 
-func New(reader *kafkago.Reader, dlqWriter KafkaWriter, pool *pgxpool.Pool, handler Handler) *Consumer {
+func New(reader *kafkago.Reader, dlqWriter KafkaWriter, pool *pgxpool.Pool, locker redis.Locker, handler Handler) *Consumer {
 	return &Consumer{
 		reader:    reader,
 		dlqWriter: dlqWriter,
 		pool:      pool,
 		queries:   db.New(pool),
+		locker:    locker,
 		handler:   handler,
 		workerID:  workerIDFromEnv(),
 	}
 }
 
-func NewWithQuerier(reader *kafkago.Reader, dlqWriter KafkaWriter, pool *pgxpool.Pool, queries db.Querier, handler Handler) *Consumer {
+func NewWithQuerier(reader *kafkago.Reader, dlqWriter KafkaWriter, pool *pgxpool.Pool, queries db.Querier, locker redis.Locker, handler Handler) *Consumer {
 	return &Consumer{
 		reader:    reader,
 		dlqWriter: dlqWriter,
 		pool:      pool,
 		queries:   queries,
+		locker:    locker,
 		handler:   handler,
 		workerID:  workerIDFromEnv(),
 	}
@@ -63,6 +68,22 @@ func (c *Consumer) Run(ctx context.Context) error {
 	)
 
 	for {
+		// if Redis is configured but unreachable, pause consuming
+		if c.locker != nil {
+			pingCtx, pingCancel := context.WithTimeout(ctx, 2*time.Second)
+			if err := c.locker.Ping(pingCtx); err != nil {
+				pingCancel()
+				slog.Error("Redis unreachable — pausing consumer loop to avoid running without locks", "error", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(3 * time.Second):
+				}
+				continue
+			}
+			pingCancel()
+		}
+
 		kafkaMsg, err := c.reader.FetchMessage(ctx)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -117,6 +138,10 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 }
 
+const (
+	defaultLockTTL = 15 * time.Second
+)
+
 func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage) bool {
 	runID, err := parseUUID(msg.RunID)
 	if err != nil {
@@ -127,7 +152,39 @@ func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage)
 		return true // Skip and commit offset so we don't poison loop on unparseable UUID
 	}
 
-	// 1. Claim run: transition QUEUED -> RUNNING and record worker_id
+	// 1. Distributed lock 
+	lockKey := fmt.Sprintf("lock:run:%s", msg.RunID)
+	if c.locker != nil {
+		lockCtx, lockCancel := context.WithTimeout(ctx, 3*time.Second)
+		acquired, lockErr := c.locker.TryLock(lockCtx, lockKey, c.workerID, defaultLockTTL)
+		lockCancel()
+
+		if lockErr != nil {
+			slog.Error("Failed to contact Redis for lock — will redeliver",
+				"run_id", msg.RunID,
+				"error", lockErr,
+			)
+			return false // retry later
+		}
+
+		if !acquired {
+			slog.Info("Run is already locked by another worker (idempotency check) — skipping",
+				"run_id", msg.RunID,
+				"worker_id", c.workerID,
+			)
+			return true  
+		}
+
+		// release lock via compare-and-delete Lua script when finished.
+		defer func() {
+			relCtx, relCancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer relCancel()
+			if relErr := c.locker.Release(relCtx, lockKey, c.workerID); relErr != nil && !errors.Is(relErr, redis.ErrLockNotHeld) {
+				slog.Warn("Failed to release Redis lock", "key", lockKey, "error", relErr)
+			}
+		}()
+	}
+
 	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer claimCancel()
 
@@ -136,15 +193,25 @@ func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage)
 		WorkerID: &c.workerID,
 	})
 	if err != nil {
-		slog.Info("Run could not be claimed (already running or terminal) — skipping",
+		slog.Info("Run could not be claimed in DB (already running or terminal) — skipping",
 			"run_id", msg.RunID,
 			"worker_id", c.workerID,
 			"error", err,
 		)
-		return true // Return true to commit offset for duplicate/stale messages
+		return true // Commit offset for duplicate/stale messages
 	}
 
 	_ = claim
+
+	stopRenewal := make(chan struct{})
+	var renewalWg sync.WaitGroup
+	if c.locker != nil {
+		renewalWg.Add(1)
+		go func() {
+			defer renewalWg.Done()
+			c.startLockRenewalWatchdog(lockKey, defaultLockTTL, stopRenewal)
+		}()
+	}
 
 	timeout := time.Duration(msg.TimeoutSeconds) * time.Second
 	if timeout <= 0 {
@@ -154,6 +221,11 @@ func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage)
 	defer handlerCancel()
 
 	handlerErr := c.runSafe(handlerCtx, msg)
+
+	if c.locker != nil {
+		close(stopRenewal)
+		renewalWg.Wait()
+	}
 
 	if handlerErr == nil {
 		// Happy path: mark succeeded
@@ -173,12 +245,36 @@ func (c *Consumer) executeAndPersist(ctx context.Context, msg *kafka.JobMessage)
 		"error", handlerErr,
 	)
 
-	// Decision 11: total executions = 1 + max_retries, so retry if nextAttempt <= max_retries
+	// total executions = 1 + max_retries, so retry if nextAttempt <= max_retries
 	if nextAttempt <= msg.MaxRetries {
 		return c.scheduleRetryWithRetry(ctx, runID, msg, nextAttempt, handlerErr)
 	}
 
 	return c.deadLetterWithRetry(ctx, runID, msg, handlerErr)
+}
+
+func (c *Consumer) startLockRenewalWatchdog(key string, ttl time.Duration, stopCh <-chan struct{}) {
+	interval := ttl / 3
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			renewCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			renewed, err := c.locker.Renew(renewCtx, key, c.workerID, ttl)
+			cancel()
+
+			if err != nil {
+				slog.Warn("Watchdog: failed to renew Redis lock", "key", key, "error", err)
+			} else if !renewed {
+				slog.Warn("Watchdog: lock renewal returned false (lost lock ownership)", "key", key)
+				return
+			}
+		}
+	}
 }
 
 func (c *Consumer) finishSucceededWithRetry(ctx context.Context, runID pgtype.UUID, msg *kafka.JobMessage) bool {
@@ -366,7 +462,7 @@ func workerIDFromEnv() string {
 	return fmt.Sprintf("%s-%d", host, os.Getpid())
 }
 
-// ExecuteAndPersistForTest exposes executeAndPersist for white-box unit testing.
+//exposes executeAndPersist for white-box unit testing.
 func (c *Consumer) ExecuteAndPersistForTest(ctx context.Context, msg *kafka.JobMessage) bool {
 	return c.executeAndPersist(ctx, msg)
 }
