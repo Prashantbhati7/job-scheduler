@@ -13,15 +13,11 @@ var (
 	ErrLockNotHeld = errors.New("lock is not held or has been acquired by another owner")
 )
 
-// interface for distributed run locking and renewal
 type Locker interface {
-	TryLock(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)  //  Returns true if the lock was acquired, false if it is held by someone else
-
+	TryLock(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)
 	Release(ctx context.Context, key, owner string) error
-
-	Renew(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)    //  extends the lock's expiration if the owner still holds it.
-
-	Ping(ctx context.Context) error	
+	Renew(ctx context.Context, key, owner string, ttl time.Duration) (bool, error)
+	Ping(ctx context.Context) error
 }
 
 type RedisLocker struct {
@@ -32,8 +28,6 @@ func NewLocker(client *redis.Client) *RedisLocker {
 	return &RedisLocker{client: client}
 }
 
-
-// KEYS[1]: lock key (e.g. lock:run:{run_id}) , ARGV[1]: owner ID (e.g. worker_id)
 const compareAndDeleteLua = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
@@ -42,8 +36,6 @@ else
 end
 `
 
-
-// KEYS[1]: lock key , ARGV[1]: owner ID , ARGV[2]: new TTL in milliseconds
 const compareAndRenewLua = `
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("PEXPIRE", KEYS[1], ARGV[2])
@@ -83,4 +75,3 @@ func (l *RedisLocker) Renew(ctx context.Context, key, owner string, ttl time.Dur
 func (l *RedisLocker) Ping(ctx context.Context) error {
 	return l.client.Ping(ctx).Err()
 }
-

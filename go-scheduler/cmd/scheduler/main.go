@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,6 +15,11 @@ import (
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/kafka"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/redis"
 	"github.com/Prashantbhati7/job-scheduler/go-scheduler/internal/scheduler"
+)
+
+const (
+	electionKey = "/scheduler/leader"
+	leaseTTLSeconds = 10
 )
 
 func main() {
@@ -30,6 +36,9 @@ func main() {
 		os.Exit(1)
 	}
 	slog.Info("Configuration loaded successfully")
+
+	nodeID := buildNodeID()
+	slog.Info("Scheduler node identity", "node_id", nodeID)
 
 	initCtx, initCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer initCancel()
@@ -71,27 +80,69 @@ func main() {
 		return
 	}
 
-	// Writer for the main job_runs topic (used by scheduler + sweeper).
 	writer := kafkaClient.NewWriter(cfg.Kafka.TopicRuns)
 	defer writer.Close()
 
 	sched := scheduler.New(pgPool, 1*time.Second, writer)
-
-	// Sweeper polls every 5 seconds — fast enough for timely retries,
-	// slow enough to not hammer the DB.
 	sweeper := scheduler.NewSweeper(pgPool, writer, 5*time.Second)
+
 
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Run the sweeper in a background goroutine alongside the main scheduler loop.
-	go sweeper.Run(runCtx)
 
-	slog.Info("Scheduler and retry sweeper started. Press Ctrl+C / SIGTERM to stop.")
-	if err := sched.Run(runCtx); err != nil {
+	elector := election.New(etcdClient, electionKey, nodeID, leaseTTLSeconds)
+
+	slog.Info("Campaigning for leadership — will block until elected.",
+		"election_key", electionKey,
+		"node", nodeID,
+	)
+
+	if err := elector.Campaign(runCtx); err != nil {
+		slog.Info("Campaign ended before winning leadership", "error", err)
+		return
+	}
+
+
+	slog.Info("Elected as leader. Starting scheduler tick loop and sweeper.",
+		"node", nodeID,
+	)
+
+	schedCtx, schedCancel := context.WithCancel(runCtx)
+	defer schedCancel()
+
+	// Sweeper runs alongside the tick loop, both share schedCtx so they stop
+	go sweeper.Run(schedCtx)
+
+	go func() {
+		// When SIGTERM arrives, resign first so the standby wins immediately.
+		<-runCtx.Done()
+		slog.Info("SIGTERM received — resigning leadership before exit.", "node", nodeID)
+		resignCtx, resignCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer resignCancel()
+		if err := elector.Resign(resignCtx); err != nil {
+			slog.Warn("Resign error (standby will still win after TTL)", "error", err)
+		}
+		schedCancel() // stop scheduler + sweeper
+	}()
+
+	slog.Info("Scheduler and retry sweeper started. SIGTERM to stop.")
+	if err := sched.Run(schedCtx); err != nil {
 		slog.Error("Scheduler loop stopped with error", "error", err)
 		os.Exit(1)
 	}
 
-	slog.Info("Scheduler service exited cleanly.")
+	slog.Info("Scheduler service exited cleanly.", "node", nodeID)
+}
+
+
+func buildNodeID() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+	if id := os.Getenv("SCHEDULER_ID"); id != "" {
+		return id
+	}
+	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
 }
